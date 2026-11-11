@@ -1,6 +1,6 @@
 #define SLIMR_TEST_MAIN
-#include "slimr/test.hpp"
-#include "slimr/sqlite.hpp"
+#include "test.hpp"
+#include "sqlite.hpp"
 
 using namespace slimr;
 
