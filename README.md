@@ -150,13 +150,31 @@ db.backup("./backups/app-backup.db");
 | Capped read-only query | `db.iterateLimited(sql, {.limit = 200, .readOnlyConnection = true})` |
 | Online backup | `db.backup(destPath)` |
 
-## Build & Test
+## Install
 
-This folder owns its header, `test.cpp`, CMake target/config, manifest, port recipe and licenses. See the [integration guide](../../README.md#integration-vcpkg--cmakeninja).
+Add `bdombro/slimr-sqlite` to `vcpkg-configuration.json`:
 
-```bash
-just test-pkg sqlite  # From the repository root; automatic native deps + ASan/UBSan
-just build           # All optimized Release suites
+```json
+{
+  "kind": "git",
+  "repository": "https://github.com/bdombro/slimr-sqlite",
+  "baseline": "<commit-sha>",
+  "packages": [
+    "slimr-sqlite"
+  ]
+}
 ```
 
-Generated output stays under root `build/deps/` and `build/cmake/{Debug,Release}/`. Consumers link `slimr::sqlite` from `find_package(slimr-sqlite CONFIG REQUIRED)`. The optional manifest `tests` feature keeps test dependencies out of production consumption.
+Declare `slimr-sqlite` in `vcpkg.json` and link `slimr::sqlite` in `CMakeLists.txt`:
+
+```cmake
+find_package(slimr-sqlite CONFIG REQUIRED)
+target_link_libraries(my_target PRIVATE slimr::sqlite)
+```
+
+## Build & Test
+
+```bash
+just test   # Debug build (ASan + UBSan) and run tests
+just build  # Optimized Release build
+```
