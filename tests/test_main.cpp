@@ -622,4 +622,97 @@ TEST_SUITE("SQLite Database") {
         REQUIRE(res.has_value());
         CHECK(depth == 66);
     }
+
+    TEST_CASE("iterateLimited overloads, readOnlyConnection, setupSql, and error paths") {
+        testing::TempDirGuard dirGuard("sqlite_iter_");
+        std::string dbPath = (dirGuard.path / "iter.db").string();
+
+        Database mem(":memory:");
+        mem.exec("CREATE TABLE nums (n INTEGER);");
+        for (int64_t i = 1; i <= 3; ++i) {
+            mem.run("INSERT INTO nums (n) VALUES (?);", {i});
+        }
+
+        auto exact = mem.iterateLimited("SELECT n FROM nums WHERE n <= :max ORDER BY n;",
+                                        std::map<std::string, SqlValue>{{"max", int64_t(3)}},
+                                        IterateOptions{.limit = 3});
+        CHECK(exact.rows.size() == 3);
+        CHECK_FALSE(exact.truncated);
+
+        auto memRo = mem.iterateLimited("SELECT n FROM nums ORDER BY n;",
+                                        IterateOptions{.limit = 2, .readOnlyConnection = true, .setupSql = "PRAGMA temp_store = MEMORY;"});
+        CHECK(memRo.rows.size() == 2);
+        CHECK(memRo.truncated);
+        CHECK(mem.pluck<int64_t>("PRAGMA query_only;").value_or(-1) == 0);
+
+        Database fileDb(dbPath);
+        fileDb.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, val INTEGER);");
+        fileDb.run("INSERT INTO items (val) VALUES (10), (20), (30);");
+        fileDb.registerFunction("add_one", [](const std::vector<SqlValue> &args) -> SqlValue {
+            return std::get<int64_t>(args[0]) + 1;
+        });
+
+        auto fileRo = fileDb.iterateLimited("SELECT add_one(val) AS v FROM items ORDER BY id;",
+                                            IterateOptions{.limit = 2, .readOnlyConnection = true, .setupSql = "PRAGMA temp_store = MEMORY;"});
+        CHECK(fileRo.columns == std::vector<std::string>{"v"});
+        CHECK(fileRo.rows.size() == 2);
+        CHECK(fileRo.truncated);
+        CHECK(fileRo.rows[0]["v"].get<int64_t>() == 11);
+
+        CHECK_THROWS_AS(
+            fileDb.iterateLimited("SELECT * FROM items;", IterateOptions{.readOnlyConnection = true, .setupSql = "BAD SQL;"}),
+            std::runtime_error);
+        CHECK_THROWS_AS(fileDb.iterateLimited("SELECT * FROM missing_tbl;", IterateOptions{}), std::runtime_error);
+
+        fileDb.registerFunction("fail_step", [](const std::vector<SqlValue> &) -> SqlValue {
+            throw std::runtime_error("step err");
+        });
+        CHECK_THROWS_AS(fileDb.iterateLimited("SELECT fail_step() FROM items;", IterateOptions{.limit = 1}), std::runtime_error);
+    }
+
+    TEST_CASE("registerFunction types, NULL/BLOB/FLOAT args, and non-std exception") {
+        Database db(":memory:");
+        db.registerFunction("echo_type", [](const std::vector<SqlValue> &args) -> SqlValue {
+            if (args.empty() || std::holds_alternative<std::monostate>(args[0])) {
+                return std::monostate{};
+            }
+            if (std::holds_alternative<double>(args[0])) {
+                return std::get<double>(args[0]) * 2.0;
+            }
+            if (std::holds_alternative<std::vector<uint8_t>>(args[0])) {
+                return std::get<std::vector<uint8_t>>(args[0]);
+            }
+            return true;
+        });
+        db.registerFunction("throw_int", [](const std::vector<SqlValue> &) -> SqlValue {
+            throw 42;
+        });
+
+        CHECK(std::holds_alternative<std::monostate>(db.pluck<SqlValue>("SELECT echo_type(NULL);").value()));
+        CHECK(db.pluck<double>("SELECT echo_type(1.5);").value_or(0.0) == doctest::Approx(3.0));
+        auto blobRes = db.pluck<std::vector<uint8_t>>("SELECT echo_type(X'AABB');");
+        REQUIRE(blobRes.has_value());
+        CHECK(*blobRes == std::vector<uint8_t>{0xAA, 0xBB});
+        auto emptyBlobRes = db.pluck<SqlValue>("SELECT echo_type(X'');");
+        REQUIRE(emptyBlobRes.has_value());
+        CHECK(std::holds_alternative<std::monostate>(*emptyBlobRes));
+        CHECK(db.pluck<bool>("SELECT echo_type(1);").value_or(false) == true);
+        CHECK_THROWS_AS(db.pluck<int64_t>("SELECT throw_int();"), std::runtime_error);
+    }
+
+    TEST_CASE("backup creates parent directories and throws on invalid destination") {
+        testing::TempDirGuard dirGuard("sqlite_bk_");
+        Database db(":memory:");
+        db.exec("CREATE TABLE bk (id INTEGER PRIMARY KEY);");
+        db.run("INSERT INTO bk (id) VALUES (42);");
+
+        auto nestedDest = dirGuard.path / "nested" / "sub" / "backup.db";
+        db.backup(nestedDest.string());
+        CHECK(std::filesystem::exists(nestedDest));
+
+        Database restored(nestedDest.string(), SqliteOptions{.readOnly = true});
+        CHECK(restored.pluck<int64_t>("SELECT id FROM bk;").value_or(0) == 42);
+
+        CHECK_THROWS_AS(db.backup(dirGuard.path.string()), std::runtime_error);
+    }
 }
