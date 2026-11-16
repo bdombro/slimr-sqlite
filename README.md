@@ -1,4 +1,4 @@
-# slimr::sqlite (`packages/sqlite`)
+# slimr::sqlite
 
 Fast, RAII SQLite 3 + FTS5 wrapper for C++26 — backed by vcpkg-managed SQLite with FTS5 with WAL defaults, a 256-statement LRU cache, `PRAGMA user_version` migrations, nested `SAVEPOINT` transactions, and isolated read-only cursors.
 
@@ -14,7 +14,27 @@ Raw C `sqlite3*` APIs require repetitive `sqlite3_prepare_v2` / `sqlite3_bind_*`
 - **Unified `migrations` on open:** Pass either an ordered `std::vector<std::string>` (`1..N`) or a version-keyed `std::map<int, std::string>` (supporting squashed baselines and stale intermediate version guards).
 - **Safe read-only agent queries (`iterateLimited`):** Opens a separate `SQLITE_OPEN_READONLY` connection, registers custom scalar functions, executes optional `setupSql` (such as `TEMP VIEW` creation), locks down `PRAGMA query_only = ON`, and steps up to `limit + 1` rows to report `{ columns, rows, truncated }`.
 
----
+## Install
+
+Add `bdombro/slimr-sqlite` to `vcpkg-configuration.json`:
+
+```json
+{
+  "kind": "git",
+  "repository": "https://github.com/bdombro/slimr-sqlite",
+  "baseline": "<commit-sha>",
+  "packages": [
+    "slimr-sqlite"
+  ]
+}
+```
+
+Declare `slimr-sqlite` in `vcpkg.json` and link `slimr::sqlite` in `CMakeLists.txt`:
+
+```cmake
+find_package(slimr-sqlite CONFIG REQUIRED)
+target_link_libraries(my_target PRIVATE slimr::sqlite)
+```
 
 ## Quick Start
 
@@ -150,31 +170,12 @@ db.backup("./backups/app-backup.db");
 | Capped read-only query | `db.iterateLimited(sql, {.limit = 200, .readOnlyConnection = true})` |
 | Online backup | `db.backup(destPath)` |
 
-## Install
+## Environment Variables
 
-Add `bdombro/slimr-sqlite` to `vcpkg-configuration.json`:
+| Name | Required | Purpose |
+| --- | --- | --- |
+| *(none)* | — | — |
 
-```json
-{
-  "kind": "git",
-  "repository": "https://github.com/bdombro/slimr-sqlite",
-  "baseline": "<commit-sha>",
-  "packages": [
-    "slimr-sqlite"
-  ]
-}
-```
+## Development
 
-Declare `slimr-sqlite` in `vcpkg.json` and link `slimr::sqlite` in `CMakeLists.txt`:
-
-```cmake
-find_package(slimr-sqlite CONFIG REQUIRED)
-target_link_libraries(my_target PRIVATE slimr::sqlite)
-```
-
-## Build & Test
-
-```bash
-just test   # Debug build (ASan + UBSan) and run tests
-just build  # Optimized Release build
-```
+See [docs/development.md](docs/development.md) for building, testing, linting, and releasing.
