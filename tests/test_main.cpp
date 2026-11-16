@@ -491,4 +491,135 @@ TEST_SUITE("SQLite Database") {
         sharedMem.exec("CREATE TABLE t (x INTEGER);");
         CHECK(sharedMem.pluck<std::string>("PRAGMA journal_mode;").value_or("") == "memory");
     }
+
+    TEST_CASE("Database lifecycle, move semantics, pragmas, and open/exec errors") {
+        testing::TempDirGuard dirGuard("sqlite_life_");
+        CHECK_THROWS_AS(Database(dirGuard.path.string()), std::runtime_error);
+        CHECK_THROWS_AS(Database((dirGuard.path / "nonexistent.db").string(), SqliteOptions{.readOnly = true}),
+                        std::runtime_error);
+
+        Database a(":memory:", SqliteOptions{
+                                   .enableDefaultPragmas = false,
+                                   .pragmas = std::string("PRAGMA foreign_keys = ON;"),
+                               });
+        CHECK(a.handle() != nullptr);
+        CHECK(a.path() == ":memory:");
+        CHECK(a.pluck<int64_t>("PRAGMA foreign_keys;").value_or(0) == 1);
+        a.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
+        a.run("INSERT INTO t (id) VALUES (?);", {int64_t(1)});
+
+        Database b(std::move(a));
+        CHECK(a.handle() == nullptr);
+        CHECK(b.handle() != nullptr);
+        CHECK(b.pluck<int64_t>("SELECT id FROM t;").value_or(0) == 1);
+
+        Database c(":memory:");
+        c = std::move(b);
+        CHECK(b.handle() == nullptr);
+        CHECK(c.pluck<int64_t>("SELECT id FROM t;").value_or(0) == 1);
+
+        CHECK_THROWS_AS(c.exec("INVALID SQL SYNTAX;"), std::runtime_error);
+    }
+
+    TEST_CASE("Empty migrations and migration rollback on error") {
+        Database emptyVec(":memory:", SqliteOptions{.migrations = std::vector<std::string>{}});
+        CHECK(emptyVec.pluck<int64_t>("PRAGMA user_version;").value_or(-1) == 0);
+
+        Database emptyMap(":memory:", SqliteOptions{.migrations = std::map<int, std::string>{}});
+        CHECK(emptyMap.pluck<int64_t>("PRAGMA user_version;").value_or(-1) == 0);
+
+        CHECK_THROWS_AS(
+            Database(":memory:", SqliteOptions{
+                                     .migrations = std::vector<std::string>{
+                                         "CREATE TABLE m1 (id INTEGER);",
+                                         "INVALID SQL;",
+                                     },
+                                 }),
+            std::runtime_error);
+    }
+
+    TEST_CASE("Tx methods, transaction modes, non-void return, and rollback") {
+        Database db(":memory:");
+        db.exec("CREATE TABLE tx_t (id INTEGER PRIMARY KEY, name TEXT);");
+
+        auto total = db.transaction([](Tx &tx) -> int64_t {
+            CHECK(tx.depth() == 1);
+            tx.exec("INSERT INTO tx_t (id, name) VALUES (1, 'one');");
+            auto r1 = tx.run("INSERT INTO tx_t (id, name) VALUES (?, ?);", {int64_t(2), std::string("two")});
+            CHECK(r1.changes == 1);
+            auto r2 = tx.run("INSERT INTO tx_t (id, name) VALUES (:id, :name);",
+                             {{"id", int64_t(3)}, {"name", std::string("three")}});
+            CHECK(r2.changes == 1);
+
+            auto g1 = tx.get("SELECT name FROM tx_t WHERE id = ?;", {int64_t(1)});
+            REQUIRE(g1.has_value());
+            CHECK((*g1)["name"].get<std::string>() == "one");
+
+            std::map<std::string, SqlValue> p2{{"id", int64_t(2)}};
+            std::map<std::string, SqlValue> p3{{"id", int64_t(3)}};
+            auto g2 = tx.get("SELECT name FROM tx_t WHERE id = :id;", p2);
+            REQUIRE(g2.has_value());
+            CHECK((*g2)["name"].get<std::string>() == "two");
+
+            CHECK(tx.all("SELECT * FROM tx_t WHERE id >= ?;", {int64_t(2)}).size() == 2);
+            CHECK(tx.all("SELECT * FROM tx_t WHERE id = :id;", p3).size() == 1);
+            CHECK(tx.pluck<std::string>("SELECT name FROM tx_t WHERE id = ?;", {int64_t(1)}).value_or("") == "one");
+            CHECK(tx.pluck<std::string>("SELECT name FROM tx_t WHERE id = :id;", p2).value_or("") == "two");
+            CHECK(tx.pluckAll<int64_t>("SELECT id FROM tx_t WHERE id <= ? ORDER BY id;", {int64_t(2)}).size() == 2);
+            CHECK(tx.pluckAll<int64_t>("SELECT id FROM tx_t WHERE id = :id;", p3).size() == 1);
+
+            auto inner = tx.transaction([](Tx &nested) -> int64_t {
+                CHECK(nested.depth() == 2);
+                nested.run("INSERT INTO tx_t (id, name) VALUES (4, 'four');");
+                return nested.pluck<int64_t>("SELECT count(*) FROM tx_t;").value_or(0);
+            });
+            CHECK(inner == 4);
+            return inner;
+        },
+                                    TransactionMode::Deferred);
+        CHECK(total == 4);
+
+        db.transaction([](Tx &tx) {
+            tx.run("INSERT INTO tx_t (id, name) VALUES (5, 'five');");
+        },
+                       TransactionMode::Exclusive);
+        CHECK(db.pluck<int64_t>("SELECT count(*) FROM tx_t;").value_or(0) == 5);
+
+        CHECK_THROWS_AS(
+            db.transaction([](Tx &tx) {
+                tx.run("INSERT INTO tx_t (id, name) VALUES (6, 'six');");
+                throw std::runtime_error("abort tx");
+            }),
+            std::runtime_error);
+        CHECK(db.pluck<int64_t>("SELECT count(*) FROM tx_t;").value_or(0) == 5);
+    }
+
+    TEST_CASE("Statement cache error paths and deep re-entrancy fallback") {
+        Database db(":memory:");
+        db.exec("CREATE TABLE sc (id INTEGER PRIMARY KEY);");
+        db.run("INSERT INTO sc (id) VALUES (1);");
+
+        CHECK_THROWS_AS(db.run("SELECT * FROM nonexistent_table;"), std::runtime_error);
+        CHECK_THROWS_AS(db.run("INSERT INTO sc (id) VALUES (1);"), std::runtime_error);
+
+        db.registerFunction("boom", [](const std::vector<SqlValue> &) -> SqlValue {
+            throw std::runtime_error("boom");
+        });
+        CHECK_THROWS_AS(db.all("SELECT boom(id) FROM sc;"), std::runtime_error);
+
+        // Exceed kMaxCacheSize (64) active statements simultaneously via nested re-entrant callbacks
+        int depth = 0;
+        db.registerFunction("recurse_q", [&](const std::vector<SqlValue> &args) -> SqlValue {
+            int n = static_cast<int>(std::get<int64_t>(args[0]));
+            if (n <= 0) {
+                return int64_t(0);
+            }
+            ++depth;
+            std::string sql = "SELECT recurse_q(" + std::to_string(n - 1) + ") + " + std::to_string(n) + ";";
+            auto v = db.pluck<int64_t>(sql);
+            return v.value_or(0); }, false);
+        auto res = db.pluck<int64_t>("SELECT recurse_q(66);");
+        REQUIRE(res.has_value());
+        CHECK(depth == 66);
+    }
 }
