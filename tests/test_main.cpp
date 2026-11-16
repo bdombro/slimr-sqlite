@@ -509,13 +509,13 @@ TEST_SUITE("SQLite Database") {
         a.run("INSERT INTO t (id) VALUES (?);", {int64_t(1)});
 
         Database b(std::move(a));
-        CHECK(a.handle() == nullptr);
+        CHECK(a.handle() == nullptr); // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move) -- verify moved-from state
         CHECK(b.handle() != nullptr);
         CHECK(b.pluck<int64_t>("SELECT id FROM t;").value_or(0) == 1);
 
         Database c(":memory:");
         c = std::move(b);
-        CHECK(b.handle() == nullptr);
+        CHECK(b.handle() == nullptr); // NOLINT(bugprone-use-after-move,clang-analyzer-cplusplus.Move) -- verify moved-from state
         CHECK(c.pluck<int64_t>("SELECT id FROM t;").value_or(0) == 1);
 
         CHECK_THROWS_AS(c.exec("INVALID SQL SYNTAX;"), std::runtime_error);
