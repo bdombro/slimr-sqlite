@@ -16,12 +16,12 @@ Raw C `sqlite3*` APIs require repetitive `sqlite3_prepare_v2` / `sqlite3_bind_*`
 
 ## Install
 
-Add `bdombro/slimr-sqlite` to `vcpkg-configuration.json`:
+Add `slimr-down-now/sqlite` to `vcpkg-configuration.json`:
 
 ```json
 {
   "kind": "git",
-  "repository": "https://github.com/bdombro/slimr-sqlite",
+  "repository": "https://github.com/slimr-down-now/sqlite",
   "baseline": "<commit-sha>",
   "packages": [
     "slimr-sqlite"
