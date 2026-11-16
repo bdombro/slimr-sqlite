@@ -466,7 +466,11 @@ TEST_SUITE("SQLite Database") {
         CHECK(structRow->ratio == doctest::Approx(4.0));
 
         CHECK_THROWS_AS(db.pluck<int>("SELECT f FROM typed WHERE id = 1;"), std::runtime_error);
+        CHECK_THROWS_AS(db.pluck<int64_t>("SELECT n FROM typed WHERE id = 2;"), std::runtime_error);
+        CHECK_THROWS_AS(db.pluck<bool>("SELECT n FROM typed WHERE id = 2;"), std::runtime_error);
         CHECK_THROWS_AS(db.pluck<double>("SELECT n FROM typed WHERE id = 2;"), std::runtime_error);
+        CHECK_THROWS_AS(db.pluck<std::string>("SELECT flag FROM typed WHERE id = 1;"), std::runtime_error);
+        CHECK_THROWS_AS(db.pluck<std::vector<uint8_t>>("SELECT flag FROM typed WHERE id = 1;"), std::runtime_error);
         CHECK_THROWS_AS(db.pluck<EmbeddedMeta>("SELECT meta FROM typed WHERE id = 2;"), std::runtime_error);
 
         db.run("CREATE TABLE big (v INTEGER);");
@@ -486,6 +490,8 @@ TEST_SUITE("SQLite Database") {
         CHECK((*row)["a"].get<int64_t>() == 7);
         CHECK((*row)["b"].get<std::string>() == "hi");
         CHECK((*row)["c"].get<double>() == doctest::Approx(2.5));
+        CHECK(db.all("SELECT a FROM np WHERE a = :a;", std::map<std::string, SqlValue>{{"a", int64_t(7)}}).size() == 1);
+        CHECK(db.pluckAll<int64_t>("SELECT a FROM np WHERE a = :a;", std::map<std::string, SqlValue>{{"a", int64_t(7)}}).size() == 1);
 
         Database sharedMem("file:memdb_cov?mode=memory&cache=shared");
         sharedMem.exec("CREATE TABLE t (x INTEGER);");
@@ -574,6 +580,16 @@ TEST_SUITE("SQLite Database") {
                 return nested.pluck<int64_t>("SELECT count(*) FROM tx_t;").value_or(0);
             });
             CHECK(inner == 4);
+            tx.transaction([](Tx &nestedVoid) {
+                nestedVoid.run("INSERT INTO tx_t (id, name) VALUES (99, 'tmp');");
+            });
+            CHECK_THROWS_AS(
+                tx.transaction([](Tx &nestedFail) {
+                    nestedFail.run("INSERT INTO tx_t (id, name) VALUES (100, 'fail');");
+                    throw std::runtime_error("inner abort");
+                }),
+                std::runtime_error);
+            tx.run("DELETE FROM tx_t WHERE id = 99;");
             return inner;
         },
                                     TransactionMode::Deferred);
