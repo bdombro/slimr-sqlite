@@ -4,7 +4,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
+#include <limits>
+#include <stdexcept>
 #include <thread>
+#include <variant>
 
 using namespace slimr;
 
@@ -402,5 +406,89 @@ TEST_SUITE("SQLite Database") {
 
         Database verify(dbPath, SqliteOptions{.readOnly = true});
         CHECK(verify.pluck<int64_t>("SELECT count(*) FROM events;").value_or(0) == kTotalWrites);
+    }
+
+    TEST_CASE("SqlValue types, column conversions, and Glaze struct extraction") {
+        struct ItemRow {
+            int64_t id = 0;
+            std::string name;
+            double ratio = 0.0;
+        };
+        struct EmbeddedMeta {
+            std::string tag;
+        };
+
+        Database db(":memory:");
+        db.exec("CREATE TABLE typed (id INTEGER PRIMARY KEY, b BLOB, f REAL, flag INTEGER, n TEXT, meta TEXT);");
+
+        std::vector<uint8_t> blobData{0x01, 0x00, 0xFE, 0x7F};
+        db.run("INSERT INTO typed (b, f, flag, n, meta) VALUES (?, ?, ?, ?, ?);",
+               {blobData, 3.25, true, std::monostate{}, std::string(R"({"tag":"ok"})")});
+        db.run("INSERT INTO typed (b, f, flag, n, meta) VALUES (X'', ?, ?, ?, ?);",
+               {int64_t(4), false, std::string("alpha"), std::string("not-json")});
+
+        auto rows = db.all("SELECT * FROM typed ORDER BY id;");
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0]["n"].is_null());
+        CHECK(rows[0]["b"].get<std::string>().size() == 4);
+        CHECK(rows[1]["b"].get<std::string>().empty());
+
+        auto vals = db.pluckAll<SqlValue>("SELECT b FROM typed ORDER BY id;");
+        REQUIRE(vals.size() == 2);
+        CHECK(std::get<std::vector<uint8_t>>(vals[0]) == blobData);
+        CHECK(std::get<std::vector<uint8_t>>(vals[1]).empty());
+
+        auto fVal = db.pluck<SqlValue>("SELECT f FROM typed WHERE id = 1;");
+        REQUIRE(fVal.has_value());
+        CHECK(std::get<double>(*fVal) == doctest::Approx(3.25));
+
+        auto nVal = db.pluck<SqlValue>("SELECT n FROM typed WHERE id = 1;");
+        REQUIRE(nVal.has_value());
+        CHECK(std::holds_alternative<std::monostate>(*nVal));
+
+        CHECK(db.pluck<double>("SELECT f FROM typed WHERE id = 1;").value_or(0.0) == doctest::Approx(3.25));
+        CHECK(db.pluck<double>("SELECT flag FROM typed WHERE id = 1;").value_or(0.0) == doctest::Approx(1.0));
+        CHECK(db.pluck<int>("SELECT flag FROM typed WHERE id = 1;").value_or(0) == 1);
+        CHECK(db.pluck<bool>("SELECT flag FROM typed WHERE id = 1;").value_or(false) == true);
+        CHECK(db.pluck<bool>("SELECT flag FROM typed WHERE id = 2;").value_or(true) == false);
+
+        CHECK_FALSE(db.get("SELECT * FROM typed WHERE id = 999;").has_value());
+        CHECK_FALSE(db.pluck<int64_t>("SELECT id FROM typed WHERE id = 999;").has_value());
+
+        auto jsonCol = db.pluck<Json>("SELECT meta FROM typed WHERE id = 1;");
+        REQUIRE(jsonCol.has_value());
+        CHECK(jsonCol->get<std::string>() == R"({"tag":"ok"})");
+
+        auto structRow = db.get<ItemRow>("SELECT id, n AS name, f AS ratio FROM typed WHERE id = 2;");
+        REQUIRE(structRow.has_value());
+        CHECK(structRow->id == 2);
+        CHECK(structRow->name == "alpha");
+        CHECK(structRow->ratio == doctest::Approx(4.0));
+
+        CHECK_THROWS_AS(db.pluck<int>("SELECT f FROM typed WHERE id = 1;"), std::runtime_error);
+        CHECK_THROWS_AS(db.pluck<double>("SELECT n FROM typed WHERE id = 2;"), std::runtime_error);
+        CHECK_THROWS_AS(db.pluck<EmbeddedMeta>("SELECT meta FROM typed WHERE id = 2;"), std::runtime_error);
+
+        db.run("CREATE TABLE big (v INTEGER);");
+        db.run("INSERT INTO big (v) VALUES (?);", {int64_t(std::numeric_limits<int>::max()) + 1});
+        CHECK_THROWS_AS(db.pluck<int>("SELECT v FROM big;"), std::overflow_error);
+    }
+
+    TEST_CASE("Named parameter prefixes and URI memory paths") {
+        Database db("file::memory:");
+        db.exec("CREATE TABLE np (a INTEGER, b TEXT, c REAL);");
+        db.run("INSERT INTO np (a, b, c) VALUES (:a, $b, @c);",
+               {{"a", int64_t(7)}, {"b", std::string("hi")}, {"@c", 2.5}, {"unused", int64_t(99)}});
+
+        auto row = db.get("SELECT a, b, c FROM np WHERE a = $a AND b = @b;",
+                          {{"$a", int64_t(7)}, {"b", std::string("hi")}});
+        REQUIRE(row.has_value());
+        CHECK((*row)["a"].get<int64_t>() == 7);
+        CHECK((*row)["b"].get<std::string>() == "hi");
+        CHECK((*row)["c"].get<double>() == doctest::Approx(2.5));
+
+        Database sharedMem("file:memdb_cov?mode=memory&cache=shared");
+        sharedMem.exec("CREATE TABLE t (x INTEGER);");
+        CHECK(sharedMem.pluck<std::string>("PRAGMA journal_mode;").value_or("") == "memory");
     }
 }
