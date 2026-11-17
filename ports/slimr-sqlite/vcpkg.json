@@ -1,6 +1,6 @@
 {
   "name": "slimr-sqlite",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Header-only SQLite wrapper with FTS5 support",
   "dependencies": [
     {
